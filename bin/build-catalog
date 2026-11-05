@@ -365,8 +365,16 @@ def main():
         if image_ok(p["image"], refresh):
             kept.append(p)
     catalog["paintings"] = kept
-    for i, p in enumerate(catalog["paintings"]):
-        p["id"] = i
+    # A key that survives rebuilds, unlike the position in the list:
+    # favourites and their Context Engine notes are filed under it.
+    keys = set()
+    for p in catalog["paintings"]:
+        base = "-".join(filter(None, [p["artist"], norm(p["title"]).replace(" ", "-")[:60].strip("-"), p["year"][:4] or "nd"]))
+        key, n = base, 2
+        while key in keys:
+            key, n = f"{base}-{n}", n + 1
+        keys.add(key)
+        p["key"] = key
     tmp = OUT + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(catalog, f, ensure_ascii=False, indent=1)

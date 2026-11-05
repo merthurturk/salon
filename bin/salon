@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Salon's favourites: kept on this computer and in Context Engine.
+
+  salon fav add <key>      Save a painting, keep a copy of its image, tell Context Engine
+  salon fav remove <key>   Take it out again (its note is archived, not deleted)
+  salon sync               Send what is waiting and take in favourites made elsewhere
+  salon list               Print the favourites as JSON
+
+Every command prints one JSON line ({"ok": …, "synced": …, "message": …}) and
+exits 0 when the favourites file was updated, 1 when it was not.
+
+The favourites file ($XDG_STATE_HOME/salon/favorites.json) is the widget's
+truth; it watches it. Context Engine is reached through the `ce` command of
+the relote.context-engine plugin. Each favourite is one note, slug
+salon-favourite-<key>, tagged salon-favourite. A change that cannot reach the
+engine is marked pending and sent on the next sync.
+"""
+
+import fcntl
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CATALOG = os.environ.get("SALON_CATALOG", os.path.join(ROOT, "catalog.json"))
+STATE = os.environ.get("SALON_STATE") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "salon")
+FAVORITES = os.path.join(STATE, "favorites.json")
+IMAGES = os.path.join(STATE, "images")
+CE = os.environ.get("SALON_CE") or os.path.expanduser(
+    "~/.config/omarchy/plugins/relote.context-engine/bin/ce")
+
+SLUG_PREFIX = "salon-favourite-"
+TAG = "salon-favourite"
+KEY = re.compile(r"^[a-z0-9][a-z0-9-]{0,120}$")
+IMAGE_HOSTS = re.compile(r"^https://(uploads\d?\.wikiart\.org|upload\.wikimedia\.org|thumb\.wikimedia\.org)/")
+MAX_IMAGE = 25 * 1024 * 1024
+UA = "salon-omarchy-widget/0.2"
+
+
+def out(ok, synced=False, message=""):
+    print(json.dumps({"ok": ok, "synced": synced, "message": message}))
+    return 0 if ok else 1
+
+
+def catalog():
+    with open(CATALOG, encoding="utf-8") as f:
+        data = json.load(f)
+    artists = data.get("artists", {})
+    by_key = {}
+    for p in data.get("paintings", []):
+        if KEY.match(str(p.get("key", ""))):
+            by_key[p["key"]] = dict(p, artistName=artists.get(p["artist"], {}).get("name", ""))
+    return by_key
+
+
+def load():
+    try:
+        with open(FAVORITES, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("items"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"version": 1, "items": {}, "lastSync": "", "syncError": ""}
+
+
+def save(state):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = FAVORITES + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, FAVORITES)
+
+
+def entry(p):
+    return {
+        "title": p.get("title", ""), "artist": p.get("artist", ""), "artistName": p.get("artistName", ""),
+        "year": p.get("year", ""), "image": p.get("image", ""), "link": (p.get("wiki") or {}).get("url") or p.get("source", ""),
+        "added": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "cached": "", "pending": "",
+    }
+
+
+def cache_image(key, item):
+    """Keep a copy so a favourite still shows if its website drops it."""
+    url = item.get("image", "")
+    if item.get("cached") and os.path.exists(os.path.join(STATE, item["cached"])):
+        return
+    if not IMAGE_HOSTS.match(url):
+        return
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            kind = r.headers.get("Content-Type", "")
+            if not kind.startswith("image/"):
+                return
+            data = r.read(MAX_IMAGE + 1)
+        if len(data) > MAX_IMAGE:
+            return
+        ext = {"image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}.get(kind.split(";")[0], ".jpg")
+        os.makedirs(IMAGES, exist_ok=True)
+        name = key + ext
+        tmp = os.path.join(IMAGES, name + ".tmp")
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, os.path.join(IMAGES, name))
+        item["cached"] = "images/" + name
+    except Exception:  # noqa: BLE001 - the original link still works; the copy is a bonus
+        pass
+
+
+def drop_image(item):
+    if item.get("cached"):
+        try:
+            os.remove(os.path.join(STATE, item["cached"]))
+        except OSError:
+            pass
+
+
+# ---- Context Engine.
+
+class Unreachable(Exception):
+    pass
+
+
+def ce(*args):
+    if not os.access(CE, os.X_OK):
+        raise Unreachable("Context Engine plugin is not installed")
+    try:
+        r = subprocess.run([CE, *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Unreachable(str(e)) from e
+    if r.returncode != 0:
+        raise Unreachable((r.stderr or r.stdout).strip().splitlines()[-1:][0] if (r.stderr or r.stdout).strip() else "ce failed")
+    return r.stdout
+
+
+def tool(name, payload):
+    text = ce("tool", name, json.dumps(payload))
+    try:
+        return json.loads(text)
+    except ValueError as e:
+        raise Unreachable("unexpected answer from Context Engine") from e
+
+
+def engine():
+    name = ce("engine").strip().splitlines()
+    if not name or not re.match(r"^[a-z0-9-]+$", name[0].strip()):
+        raise Unreachable("no Context Engine engine is set")
+    return name[0].strip()
+
+
+def note_body(key, item):
+    lines = [f"A painting Mert saved in Salon, the art widget on the Omarchy bar.", "",
+             f"- **Painting:** {item['title']}",
+             f"- **Artist:** {item['artistName']}"]
+    if item.get("year"):
+        lines.append(f"- **Year:** {item['year']}")
+    if item.get("link"):
+        lines.append(f"- **Page:** {item['link']}")
+    if item.get("image"):
+        lines.append(f"- **Image:** {item['image']}")
+    lines.append(f"- **Salon key:** `{key}`")
+    return "\n".join(lines)
+
+
+def push_add(eng, key, item):
+    byline = item["artistName"] + (", " + item["year"] if item.get("year") else "")
+    tool("write", {
+        "engine": eng, "type": "note", "slug": SLUG_PREFIX + key,
+        "title": f"Favourite painting: {item['title']} — {byline}",
+        "body": note_body(key, item),
+        "tags": ["salon", TAG, "artist:" + item["artist"], "machine:" + socket.gethostname()],
+    })
+    # Saving a painting that was removed before brings its archived note back.
+    try:
+        tool("edit", {"engine": eng, "ref": "note::" + SLUG_PREFIX + key, "archived": False})
+    except Unreachable:
+        pass
+
+
+def push_remove(eng, key):
+    try:
+        tool("edit", {"engine": eng, "ref": "note::" + SLUG_PREFIX + key, "archived": True})
+    except Unreachable as e:
+        # Already gone (removed from the console, say) is as good as removed.
+        if not str(e).startswith("No note::") and "not found" not in str(e).lower():
+            raise
+
+
+def pull(eng):
+    """Every favourite in the engine, or Unreachable: never a partial list,
+    since a key missing from it means the favourite was removed elsewhere."""
+    keys, cursor = set(), None
+    for _ in range(40):
+        payload = {"engine": eng, "tags": [TAG], "type": ["note"], "order": "oldest", "limit": 50}
+        if cursor:
+            payload["cursor"] = cursor
+        data = tool("find", payload).get("data", {})
+        for hit in data.get("hits", []):
+            ref = str(hit.get("ref", ""))
+            if ref.startswith("note::" + SLUG_PREFIX):
+                key = ref[len("note::" + SLUG_PREFIX):]
+                if KEY.match(key):
+                    keys.add(key)
+        cursor = data.get("cursor")
+        if not cursor or not data.get("hits"):
+            return keys
+    raise Unreachable("too many favourites to list")
+
+
+def sync(state, paintings):
+    eng = engine()
+    items = state["items"]
+    for key, item in list(items.items()):
+        if item.get("pending") == "add":
+            push_add(eng, key, item)
+            item["pending"] = ""
+        elif item.get("pending") == "remove":
+            push_remove(eng, key)
+            drop_image(item)
+            del items[key]
+    remote = pull(eng)
+    for key in list(items):
+        if key not in remote and not items[key].get("pending"):
+            drop_image(items[key])
+            del items[key]
+    for key in remote - set(items):
+        if key in paintings:
+            items[key] = entry(paintings[key])
+            cache_image(key, items[key])
+    state["lastSync"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    state["syncError"] = ""
+
+
+def with_sync(state, paintings, message):
+    try:
+        sync(state, paintings)
+        save(state)
+        return out(True, True, message)
+    except Unreachable as e:
+        state["syncError"] = str(e)[:200]
+        save(state)
+        return out(True, False, f"{message}; Context Engine: {e}")
+
+
+def main(argv):
+    os.makedirs(STATE, exist_ok=True)
+    with open(os.path.join(STATE, ".lock"), "w") as lock:
+        # Quick toggles queue up here rather than writing over each other.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = load()
+        try:
+            paintings = catalog()
+        except (OSError, ValueError) as e:
+            print(f"salon: cannot read the catalog: {e}", file=sys.stderr)
+            return out(False, message="catalog unreadable")
+
+        if argv[:2] == ["fav", "add"] and len(argv) == 3:
+            key = argv[2]
+            if key not in paintings:
+                print(f"salon: no painting {key!r}", file=sys.stderr)
+                return out(False, message="unknown painting")
+            item = state["items"].get(key) or entry(paintings[key])
+            item["pending"] = "add"
+            state["items"][key] = item
+            save(state)
+            cache_image(key, item)
+            save(state)
+            return with_sync(state, paintings, "saved")
+
+        if argv[:2] == ["fav", "remove"] and len(argv) == 3:
+            key = argv[2]
+            if key not in state["items"]:
+                return out(True, message="not a favourite")
+            state["items"][key]["pending"] = "remove"
+            save(state)
+            return with_sync(state, paintings, "removed")
+
+        if argv == ["sync"]:
+            return with_sync(state, paintings, "synced")
+
+        if argv == ["list"]:
+            print(json.dumps(state["items"], ensure_ascii=False, indent=1))
+            return 0
+
+        print(__doc__.strip(), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

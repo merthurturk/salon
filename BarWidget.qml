@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
@@ -27,6 +28,21 @@ BarWidget {
   function close() { if (panelLoader.item) panelLoader.item.close() }
   function toggle() { if (panelLoader.item) panelLoader.item.toggle() }
   function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
+
+  // For keybindings and scripts: omarchy-shell mert.salon <function>.
+  IpcHandler {
+    target: "mert.salon"
+
+    function next(): void { if (panelLoader.item) panelLoader.item.next() }
+    function favorite(): void { if (panelLoader.item) panelLoader.item.toggleFavorite() }
+    function fullView(): void { if (panelLoader.item) panelLoader.item.showFullView() }
+    function closeFullView(): void { if (panelLoader.item && panelLoader.item.fullView) panelLoader.item.closeFullView() }
+    function favorites(): void {
+      if (!panelLoader.item) return
+      panelLoader.item.openGrid()
+      if (!root.opened) root.open()
+    }
+  }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight

@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+# A stand-in for Context Engine's `ce`: notes live in $FAKE_CE_DB.
+# FAKE_CE_DOWN=1 makes every call fail, like being offline.
+import json, os, sys
+if os.environ.get("FAKE_CE_DOWN"):
+    print("ce: could not reach host", file=sys.stderr); sys.exit(1)
+db_path = os.environ["FAKE_CE_DB"]
+db = json.load(open(db_path)) if os.path.exists(db_path) else {}
+args = sys.argv[1:]
+if args == ["engine"]:
+    print("assistant"); sys.exit(0)
+name, payload = args[1], json.loads(args[2])
+if name == "write":
+    db["note::" + payload["slug"]] = {"title": payload["title"], "tags": payload["tags"], "archived": False, "body": payload["body"]}
+    result = {"ref": "note::" + payload["slug"]}
+elif name == "edit":
+    if payload["ref"] not in db:
+        print("not found: " + payload["ref"], file=sys.stderr); sys.exit(2)
+    db[payload["ref"]]["archived"] = payload["archived"]
+    result = {"ref": payload["ref"]}
+elif name == "find":
+    hits = [{"ref": r} for r, n in db.items() if not n["archived"] and payload["tags"][0] in n["tags"]]
+    result = {"hits": hits}
+json.dump(db, open(db_path, "w"))
+print(json.dumps({"text": "", "data": result}))

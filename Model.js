@@ -46,13 +46,18 @@ function parseCatalog(text) {
   }
 
   var paintings = []
+  var byKey = {}
   var list = Array.isArray(raw.paintings) ? raw.paintings.slice(0, MAX_PAINTINGS) : []
   for (var i = 0; i < list.length; i++) {
     var p = list[i] || {}
     var image = str(p.image, 600)
     if (!artists[p.artist] || !IMAGE_HOSTS.test(image)) continue
     var wiki = p.wiki && typeof p.wiki === "object" ? p.wiki : null
+    var key = str(p.key, 130)
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(key) || byKey[key] !== undefined) continue
+    byKey[key] = paintings.length
     paintings.push({
+      key: key,
       artist: p.artist,
       title: str(p.title, MAX_SHORT) || "Untitled",
       year: str(p.year, 20),
@@ -69,7 +74,42 @@ function parseCatalog(text) {
       link: safeLink(wiki && wiki.url ? wiki.url : p.source)
     })
   }
-  return { artists: artists, artistIds: artistIds, paintings: paintings }
+  return { artists: artists, artistIds: artistIds, paintings: paintings, byKey: byKey }
+}
+
+// The favourites file bin/salon writes. Only what the widget needs: which
+// keys are favourites (newest first), where a kept copy of the image is, and
+// whether Context Engine could be reached. Keys the catalog does not know are
+// left out, and so are favourites being removed.
+function parseFavorites(text, catalog) {
+  var result = { keys: [], cached: {}, syncError: "" }
+  var raw
+  try { raw = JSON.parse(text) } catch (e) { return result }
+  if (!raw || typeof raw !== "object" || !raw.items || typeof raw.items !== "object") return result
+  var rows = []
+  for (var key in raw.items) {
+    var item = raw.items[key] || {}
+    if (catalog.byKey[key] === undefined || item.pending === "remove") continue
+    rows.push({ key: key, added: str(item.added, 40) })
+    var cached = str(item.cached, 200)
+    if (/^images\/[a-z0-9-]+\.(jpg|png|webp|gif)$/.test(cached)) result.cached[key] = cached
+  }
+  rows.sort(function(a, b) { return a.added < b.added ? 1 : a.added > b.added ? -1 : 0 })
+  result.keys = rows.map(function(r) { return r.key })
+  result.syncError = str(raw.syncError, 200)
+  return result
+}
+
+// A random favourite, skipping the ones shown lately while others remain.
+function pickFavorite(catalog, keys, recent, random) {
+  random = random || Math.random
+  var indexes = keys.map(function(k) { return catalog.byKey[k] }).filter(function(i) { return i !== undefined })
+  if (!indexes.length) return -1
+  var seen = {}
+  for (var r = 0; r < (recent || []).length; r++) seen[recent[r]] = true
+  var fresh = indexes.filter(function(i) { return !seen[i] })
+  var pool = fresh.length ? fresh : indexes
+  return pool[Math.floor(random() * pool.length)]
 }
 
 // Indexes of the paintings by each artist, limited to the artists the user
@@ -156,6 +196,6 @@ function frameHeight(painting, width, maxHeight) {
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { parseCatalog: parseCatalog, byArtist: byArtist, pick: pick, remember: remember,
+  module.exports = { parseCatalog: parseCatalog, parseFavorites: parseFavorites, pickFavorite: pickFavorite, byArtist: byArtist, pick: pick, remember: remember,
     byline: byline, facts: facts, note: note, frameHeight: frameHeight, safeLink: safeLink, RECENT: RECENT }
 }
