@@ -1,86 +1,74 @@
 #!/usr/bin/env python3
-"""Build catalog.json: the paintings Salon picks from.
+"""Build a Salon catalog: the paintings the widget picks from.
 
-The widget never queries an API at runtime; it only loads images. Everything
-it shows besides the picture (title, year, medium, collection, notes) comes
-from the catalog this script writes, so it is fetched once, checked here, and
-committed.
+  bin/build-catalog                         the built-in catalog (catalog.json)
+  bin/build-catalog --artists "francis-bacon, Philip Guston" --out PATH
 
-Sources:
-  - WikiArt's app endpoints for each artist's works and their details.
-  - Wikipedia's REST summaries, for the artists and for any painting with an
-    article of its own.
-  - Wikimedia Commons for George Condo, who is not on WikiArt.
+Artists are WikiArt names or slugs ("Francis Bacon" and "francis-bacon" are
+the same). An artist WikiArt does not have, or whose images it withholds, is
+looked up on Wikipedia and Wikimedia Commons instead.
 
-Raw responses are cached under .cache/ so a rerun after a failure resumes.
+The widget never queries an API while you look at paintings; it only loads
+images. Everything else it shows (title, year, medium, collection, notes)
+comes from the catalog this script writes. Every image link is checked here
+and the broken ones left out.
 
-Usage: bin/build-catalog [--refresh]
+Sources: WikiArt's app endpoints (unofficial), Wikipedia's REST summaries, and
+Wikimedia Commons. Raw answers are cached (--cache, default
+$XDG_CACHE_HOME/salon/http) so a rerun resumes and a rebuild is quick.
+
+Progress goes to stdout as lines the widget reads:
+  progress <done> <total> <artist name>
+  done <paintings> <path>
+Problems go to stderr; the exit status is 0 when a catalog was written.
 """
 
+import argparse
 import concurrent.futures
 import html
 import json
 import os
+import random
 import re
 import sys
 import time
 import unicodedata
-import urllib.parse
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CACHE = os.path.join(ROOT, ".cache")
-OUT = os.path.join(ROOT, "catalog.json")
-UA = "salon-omarchy-widget/0.1 (personal desktop widget; https://github.com/)"
+UA = "salon-omarchy-widget/0.3 (https://github.com/merthurturk/salon)"
 
-# Each artist: WikiArt slug (or None), Wikipedia article, and the Wikipedia
-# categories that hold articles about single paintings.
-ARTISTS = [
-    {"id": "goya", "name": "Francisco Goya", "wikiart": "francisco-goya",
-     "wiki": "Francisco_Goya", "categories": ["Paintings_by_Francisco_Goya", "Black_Paintings"]},
-    {"id": "ensor", "name": "James Ensor", "wikiart": "james-ensor",
-     "wiki": "James_Ensor", "categories": ["Paintings_by_James_Ensor"]},
-    {"id": "bacon", "name": "Francis Bacon", "wikiart": "francis-bacon",
-     "wiki": "Francis_Bacon_(artist)", "categories": ["Paintings_by_Francis_Bacon"]},
-    {"id": "dekooning", "name": "Willem de Kooning", "wikiart": "willem-de-kooning",
-     "wiki": "Willem_de_Kooning", "categories": ["Paintings_by_Willem_de_Kooning"]},
-    {"id": "guston", "name": "Philip Guston", "wikiart": "philip-guston",
-     "wiki": "Philip_Guston", "categories": ["Paintings_by_Philip_Guston"]},
-    {"id": "dubuffet", "name": "Jean Dubuffet", "wikiart": "jean-dubuffet",
-     "wiki": "Jean_Dubuffet", "categories": ["Paintings_by_Jean_Dubuffet"]},
-    {"id": "appel", "name": "Karel Appel", "wikiart": "karel-appel",
-     "wiki": "Karel_Appel", "categories": []},
-    {"id": "jorn", "name": "Asger Jorn", "wikiart": "asger-jorn",
-     "wiki": "Asger_Jorn", "categories": []},
-    {"id": "condo", "name": "George Condo", "wikiart": None,
-     "wiki": "George_Condo", "categories": []},
-]
+# The built-in catalog: masters whose work is out of copyright, so a fresh
+# install shows something at once with nothing to clear.
+DEFAULT_ARTISTS = ["francisco-goya", "hieronymus-bosch", "pieter-bruegel-the-elder",
+                   "rembrandt", "william-turner", "vincent-van-gogh"]
 
-# Condo is not on WikiArt; these are the freely licensed photographs of his
-# paintings on Wikimedia Commons, with what their pages say about them.
-CONDO = [
-    {"file": "George Condo, The Cracked Cardinal.jpg", "title": "The Cracked Cardinal", "year": "2004", "medium": "oil on canvas"},
-    {"file": "The clown.george condo-2.jpg", "title": "The Clown", "year": "2010", "medium": "oil on canvas"},
-    {"file": "The Cloudmaker.jpeg", "title": "The Cloudmaker", "year": "", "medium": "oil on canvas"},
-    {"file": "La Femme du jour, 1987, George Condo.jpg", "title": "La Femme du jour", "year": "1987", "medium": ""},
-]
-
-# Genres that are not finished paintings. The widget promises paintings.
+MAX_ARTISTS = 40
 SKIP_GENRES = {"sketch and study", "design", "illustration", "poster", "caricature"}
 SKIP_TECHNIQUES = ("etching", "aquatint", "lithograph", "drypoint", "engraving",
                    "woodcut", "print", "chalk", "pencil", "charcoal", "ink", "pen")
 PLACEHOLDER = "FRAME-600x480"
-
 MAX_EXTRACT = 700
 MAX_FIELD = 160
+
+CACHE = ""
+_images = None
+
+
+def log(message):
+    print(message, file=sys.stderr, flush=True)
 
 
 def fetch(url, cache_name, refresh=False, attempts=3):
     path = os.path.join(CACHE, cache_name)
     if not refresh and os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except ValueError:
+            pass
     last = None
     for attempt in range(attempts):
         try:
@@ -92,22 +80,28 @@ def fetch(url, cache_name, refresh=False, attempts=3):
                 json.dump(data, f)
             os.replace(path + ".tmp", path)
             return data
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code == 404:
+                break
+            time.sleep(2 * (attempt + 1))
         except Exception as e:  # noqa: BLE001 - every failure is retried, then reported
             last = e
             time.sleep(1.5 * (attempt + 1))
-    print(f"  ! {url}: {last}", file=sys.stderr)
+    log(f"  ! {url}: {last}")
     return None
 
 
-_heads = None
-
-
 def image_ok(url, refresh=False):
-    global _heads
+    """Does the image load? Checked once per link; the answers are cached."""
+    global _images
     path = os.path.join(CACHE, "images.json")
-    if _heads is None:
-        _heads = {} if refresh or not os.path.exists(path) else json.load(open(path, encoding="utf-8"))
-    if url not in _heads:
+    if _images is None:
+        try:
+            _images = {} if refresh else json.load(open(path, encoding="utf-8"))
+        except (OSError, ValueError):
+            _images = {}
+    if url not in _images:
         status = 0
         for attempt in range(3):
             try:
@@ -122,13 +116,12 @@ def image_ok(url, refresh=False):
                 time.sleep(2 * (attempt + 1))
             except Exception:  # noqa: BLE001 - network trouble is retried, then counted as a failure
                 time.sleep(2 * (attempt + 1))
-        _heads[url] = status
+        _images[url] = status
+        os.makedirs(CACHE, exist_ok=True)
         with open(path + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(_heads, f)
+            json.dump(_images, f)
         os.replace(path + ".tmp", path)
-    if _heads[url] != 200:
-        print(f"  - dropping {url} ({_heads[url]})", file=sys.stderr)
-    return _heads[url] == 200
+    return _images[url] == 200
 
 
 def clean(value, limit=MAX_FIELD):
@@ -146,71 +139,9 @@ def norm(title):
     return re.sub(r"[^a-z0-9]+", " ", t).strip()
 
 
-def wiki_summary(title, refresh=False):
-    slug = title.replace(" ", "_")
-    url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(slug, safe="")
-    data = fetch(url, "wiki/" + re.sub(r"[^A-Za-z0-9_.-]", "_", slug) + ".json", refresh)
-    if not data or data.get("type") != "standard":
-        return None
-    extract = clean(data.get("extract"), 4000)
-    if len(extract) > MAX_EXTRACT:
-        cut = extract[:MAX_EXTRACT]
-        extract = cut[:cut.rfind(". ") + 1] if ". " in cut else cut.rstrip() + "…"
-    return {
-        "title": clean(data.get("title")),
-        "extract": extract,
-        "url": (data.get("content_urls") or {}).get("desktop", {}).get("page", ""),
-        "description": clean(data.get("description")),
-    }
-
-
-def wiki_category(category, refresh=False):
-    url = ("https://en.wikipedia.org/w/api.php?action=query&list=categorymembers&cmtype=page"
-           "&cmlimit=500&format=json&cmtitle=Category:" + urllib.parse.quote(category))
-    data = fetch(url, f"wikicat/{category}.json", refresh) or {}
-    return [m["title"] for m in data.get("query", {}).get("categorymembers", [])
-            if not m["title"].startswith("List of")]
-
-
-def wiki_search(query, refresh=False):
-    url = ("https://en.wikipedia.org/w/api.php?action=query&list=search&srnamespace=0&srlimit=50"
-           "&format=json&srsearch=" + urllib.parse.quote(query))
-    data = fetch(url, "wikisearch/" + re.sub(r"[^A-Za-z0-9]+", "_", query) + ".json", refresh) or {}
-    return [m["title"] for m in data.get("query", {}).get("search", [])]
-
-
-def wiki_painting(title, artist, refresh=False):
-    """A painting built from a Wikipedia article alone, for works WikiArt lacks."""
-    url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(title.replace(" ", "_"), safe="")
-    data = fetch(url, "wiki/" + re.sub(r"[^A-Za-z0-9_.-]", "_", title.replace(" ", "_")) + ".json", refresh)
-    if not data or data.get("type") != "standard":
-        return None
-    description = clean(data.get("description"))
-    surname = artist["name"].split()[-1].lower()
-    if "painting" not in description.lower() or surname not in description.lower():
-        return None
-    image = (data.get("originalimage") or data.get("thumbnail") or {})
-    if not image.get("source", "").startswith("https://upload.wikimedia.org/"):
-        return None
-    source, width, height = image["source"].split("?")[0], int(image.get("width") or 0), int(image.get("height") or 0)
-    # Commons originals can run to tens of megabytes; ask for the 1280px
-    # rendition instead. Fair-use files on en.wikipedia are small already.
-    m = re.match(r"https://upload\.wikimedia\.org/wikipedia/commons/(\w/\w\w)/([^/]+)$", source)
-    if m and width > 1280:
-        source = f"https://upload.wikimedia.org/wikipedia/commons/thumb/{m.group(1)}/{m.group(2)}/1280px-{m.group(2)}"
-        height, width = round(height * 1280 / width), 1280
-    summary = wiki_summary(title, refresh)
-    # "Woman III is a 1953 painting by…": the year is in the first sentence
-    # when the short description leaves it out.
-    lead = first_sentences(summary["extract"], 1) if summary else ""
-    year = re.search(r"\b(1[5-9]\d\d|20\d\d)\b", description + " " + title + " " + lead)
-    return {
-        "artist": artist["id"], "title": clean(re.sub(r"\s*\(.*?\)$", "", data.get("title", ""))),
-        "year": year.group(1) if year else "", "image": source, "width": width, "height": height,
-        "style": "", "genre": "", "medium": "", "size": "", "collection": "", "series": "",
-        "description": "", "source": summary["url"] if summary else "",
-        "wiki": {"extract": summary["extract"], "url": summary["url"]} if summary else None,
-    }
+def slugify(name):
+    s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower().strip()
+    return re.sub(r"[^a-z0-9]+", "-", s).strip("-")[:60]
 
 
 def first_sentences(text, n=2):
@@ -218,153 +149,287 @@ def first_sentences(text, n=2):
     return " ".join(parts[:n])
 
 
-def is_painting(detail):
-    genre = (detail.get("genre") or "").lower()
+def safe_name(s):
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", s)[:150]
+
+
+# ---- Wikipedia and Commons.
+
+def wiki_summary(title, refresh=False):
+    slug = title.replace(" ", "_")
+    url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + urllib.parse.quote(slug, safe="")
+    data = fetch(url, "wiki/" + safe_name(slug) + ".json", refresh)
+    if not data or data.get("type") != "standard":
+        return None
+    extract = clean(data.get("extract"), 4000)
+    if len(extract) > MAX_EXTRACT:
+        cut = extract[:MAX_EXTRACT]
+        extract = cut[:cut.rfind(". ") + 1] if ". " in cut else cut.rstrip() + "…"
+    image = data.get("originalimage") or data.get("thumbnail") or {}
+    return {
+        "title": clean(data.get("title")),
+        "extract": extract,
+        "url": (data.get("content_urls") or {}).get("desktop", {}).get("page", ""),
+        "description": clean(data.get("description")),
+        "image": image,
+    }
+
+
+def wiki_category(category, refresh=False):
+    url = ("https://en.wikipedia.org/w/api.php?action=query&list=categorymembers&cmtype=page"
+           "&cmlimit=500&format=json&cmtitle=Category:" + urllib.parse.quote(category))
+    data = fetch(url, "wikicat/" + safe_name(category) + ".json", refresh) or {}
+    return [m["title"] for m in data.get("query", {}).get("categorymembers", [])
+            if not m["title"].startswith("List of")]
+
+
+def wiki_search(query, refresh=False):
+    url = ("https://en.wikipedia.org/w/api.php?action=query&list=search&srnamespace=0&srlimit=50"
+           "&format=json&srsearch=" + urllib.parse.quote(query))
+    data = fetch(url, "wikisearch/" + safe_name(query) + ".json", refresh) or {}
+    return [m["title"] for m in data.get("query", {}).get("search", [])]
+
+
+def sized(source, width, height):
+    """Commons originals can run to tens of megabytes; ask for the 1280px
+    rendition instead. Fair-use files on en.wikipedia are small already."""
+    m = re.match(r"https://upload\.wikimedia\.org/wikipedia/commons/(\w/\w\w)/([^/]+)$", source)
+    if m and width > 1280:
+        return (f"https://upload.wikimedia.org/wikipedia/commons/thumb/{m.group(1)}/{m.group(2)}/1280px-{m.group(2)}",
+                1280, round(height * 1280 / width))
+    return source, width, height
+
+
+def year_in(*texts):
+    m = re.search(r"\b(1[2-9]\d\d|20\d\d)\b", " ".join(texts))
+    return m.group(1) if m else ""
+
+
+def wiki_painting(title, artist, refresh=False):
+    """A painting from a Wikipedia article alone, for works WikiArt lacks."""
+    s = wiki_summary(title, refresh)
+    if not s:
+        return None
+    surname = artist["name"].split()[-1].lower()
+    if "painting" not in s["description"].lower() or surname not in s["description"].lower():
+        return None
+    source = str(s["image"].get("source", "")).split("?")[0]
+    if not source.startswith("https://upload.wikimedia.org/"):
+        return None
+    source, width, height = sized(source, int(s["image"].get("width") or 0), int(s["image"].get("height") or 0))
+    return blank(artist, re.sub(r"\s*\(.*?\)$", "", s["title"]),
+                 year_in(s["description"], title, first_sentences(s["extract"], 1)),
+                 source, width, height, s["url"], wiki={"extract": s["extract"], "url": s["url"]})
+
+
+def commons_paintings(artist, refresh=False):
+    """Freely licensed photographs of the artist's paintings on Commons."""
+    query = f'"{artist["name"]}" painting'
+    url = ("https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6"
+           "&gsrlimit=30&prop=imageinfo&iiprop=url|size|mime|extmetadata&iiurlwidth=1280&format=json"
+           "&gsrsearch=" + urllib.parse.quote(query))
+    data = fetch(url, "commons/" + safe_name(artist["slug"]) + ".json", refresh) or {}
+    name = artist["name"].lower()
+    out = []
+    for page in (data.get("query", {}).get("pages") or {}).values():
+        info = (page.get("imageinfo") or [None])[0]
+        if not info or info.get("mime") not in ("image/jpeg", "image/png"):
+            continue
+        meta = info.get("extmetadata") or {}
+        description = clean(meta.get("ImageDescription", {}).get("value"), 400)
+        filename = page["title"][5:]
+        if name not in (description + " " + filename).lower():
+            continue
+        if "fair use" in clean(meta.get("LicenseShortName", {}).get("value")).lower():
+            continue
+        # Commons search also finds photographs of the artist, exhibition
+        # views, prints, and images made "in the style of" them.
+        haystack = (description + " " + filename).lower()
+        if any(word in haystack for word in NOT_PAINTINGS):
+            continue
+        title = title_from_filename(clean(meta.get("ObjectName", {}).get("value")) or filename, artist["name"])
+        if not title:
+            continue
+        image = (info.get("thumburl") or info.get("url") or "").split("?")[0]
+        out.append(blank(artist, title, year_in(filename, description, clean(meta.get("DateTimeOriginal", {}).get("value"))),
+                         image, int(info.get("thumbwidth") or info.get("width") or 0),
+                         int(info.get("thumbheight") or info.get("height") or 0), info.get("descriptionurl", ""),
+                         medium="oil on canvas" if "oil on canvas" in (description + filename).lower() else ""))
+    return out
+
+
+NOT_PAINTINGS = ("dall", "ai-generated", "ai generated", "midjourney", "stable diffusion", "in style of",
+                 "in the style of", "photograph", "poseert", "bestanddeel", "tentoonstelling", "exhibition",
+                 "litho", "print", "poster", "portrait of the artist", "masterpiece", "museum of modern art",
+                 "installation view", "gallery view")
+
+
+def title_from_filename(filename, name):
+    t = re.sub(r"\.[a-z]+$", "", filename, flags=re.I)
+    t = re.sub(re.escape(name), "", t, flags=re.I)
+    t = re.sub(r"\b(1[2-9]\d\d|20\d\d)\b|oil on canvas|painting|-\d+$", "", t, flags=re.I)
+    t = re.sub(r"^[\s,.\-_]+|[\s,.\-_]+$", "", re.sub(r"[_.]+", " ", t))
+    t = re.sub(r"\s*,\s*", ", ", t).strip(", ")
+    return t[:1].upper() + t[1:] if len(t) > 2 else ""
+
+
+# ---- WikiArt.
+
+def is_painting(d):
+    genre = (d.get("genre") or "").lower()
     if genre in SKIP_GENRES:
         return False
-    material = " ".join(filter(None, [detail.get("material"), detail.get("technique")])).lower()
-    tags = (detail.get("tags") or "").lower()
+    material = " ".join(filter(None, [d.get("material"), d.get("technique")])).lower()
+    tags = (d.get("tags") or "").lower()
     if "sketch" in tags and "oil" not in material:
         return False
-    if material and "oil" not in material and "acrylic" not in material and "tempera" not in material \
-            and "canvas" not in material and "panel" not in material and "board" not in material \
+    if material and not any(m in material for m in ("oil", "acrylic", "tempera", "canvas", "panel", "board")) \
             and any(t in material for t in SKIP_TECHNIQUES):
         return False
-    image = detail.get("image") or ""
+    image = d.get("image") or ""
     return image.startswith("https://") and PLACEHOLDER not in image
 
 
-def wikiart_paintings(artist, refresh):
-    slug = artist["wikiart"]
-    listing = fetch(f"https://www.wikiart.org/en/App/Painting/PaintingsByArtist?artistUrl={slug}&json=2",
-                    f"wikiart/{slug}.json", refresh) or []
-    ids = [p["contentId"] for p in listing]
+def blank(artist, title, year, image, width, height, source, wiki=None, medium=""):
+    p = {"artist": artist["slug"], "title": clean(title), "year": year, "image": image,
+         "width": width, "height": height, "style": "", "genre": "", "medium": medium, "size": "",
+         "collection": "", "series": "", "description": "", "source": source}
+    if wiki:
+        p["wiki"] = wiki
+    return p
 
-    def detail(cid):
-        return fetch(f"https://www.wikiart.org/en/App/Painting/ImageJson/{cid}", f"wikiart/{slug}/{cid}.json", refresh)
+
+def wikiart_paintings(artist, listing, preferred, cap, refresh):
+    # Large œuvres are sampled, the same way on every build, keeping first
+    # the works that have a Wikipedia article.
+    rng = random.Random(artist["slug"])
+    first = [p for p in listing if norm(p.get("title", "")) in preferred]
+    rest = [p for p in listing if norm(p.get("title", "")) not in preferred]
+    rng.shuffle(rest)
+    chosen = (first + rest)[: int(cap * 1.4)]  # room for the ones the filters drop
+
+    def detail(p):
+        cid = p["contentId"]
+        return fetch(f"https://www.wikiart.org/en/App/Painting/ImageJson/{cid}",
+                     f"wikiart/{artist['slug']}/{cid}.json", refresh)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        details = list(pool.map(detail, ids))
+        details = list(pool.map(detail, chosen))
     out = []
     for d in details:
         if not d or not is_painting(d):
             continue
-        size = ""
-        if d.get("sizeX") and d.get("sizeY"):
-            size = f"{d['sizeX']:g} × {d['sizeY']:g} cm"
-        medium = ", ".join(filter(None, [clean(d.get("material")), clean(d.get("technique"))]))
-        out.append({
-            "artist": artist["id"],
-            "title": clean(d.get("title")),
-            "year": clean(d.get("yearAsString"), 20),
-            "image": d["image"],
-            "width": int(d.get("width") or 0),
-            "height": int(d.get("height") or 0),
-            "style": clean(d.get("style")),
-            "genre": clean(d.get("genre")),
-            "medium": medium,
-            "size": size,
-            "collection": clean(d.get("galleryName")),
-            "series": clean(d.get("serie")),
-            "description": clean(d.get("description"), MAX_EXTRACT),
-            "source": f"https://www.wikiart.org/en/{d.get('artistUrl', slug)}/{d.get('url', '')}",
-        })
+        size = f"{d['sizeX']:g} × {d['sizeY']:g} cm" if d.get("sizeX") and d.get("sizeY") else ""
+        p = blank(artist, d.get("title"), clean(d.get("yearAsString"), 20), d["image"],
+                  int(d.get("width") or 0), int(d.get("height") or 0),
+                  f"https://www.wikiart.org/en/{d.get('artistUrl', artist['slug'])}/{d.get('url', '')}",
+                  medium=", ".join(filter(None, [clean(d.get("material")), clean(d.get("technique"))])))
+        p.update(style=clean(d.get("style")), genre=clean(d.get("genre")), size=size,
+                 collection=clean(d.get("galleryName")), series=clean(d.get("serie")),
+                 description=clean(d.get("description"), MAX_EXTRACT))
+        out.append(p)
     return out
 
 
-def condo_paintings(refresh):
-    titles = "|".join("File:" + c["file"] for c in CONDO)
-    url = ("https://commons.wikimedia.org/w/api.php?action=query&prop=imageinfo&iiprop=url|size"
-           "&iiurlwidth=1200&format=json&titles=" + urllib.parse.quote(titles))
-    data = fetch(url, "commons/condo.json", refresh) or {}
-    by_file = {}
-    for page in data.get("query", {}).get("pages", {}).values():
-        info = (page.get("imageinfo") or [None])[0]
-        if info:
-            by_file[page["title"][5:]] = info
-    out = []
-    for c in CONDO:
-        info = by_file.get(c["file"])
-        if not info:
-            print(f"  ! Commons has no {c['file']}", file=sys.stderr)
-            continue
-        image = info.get("thumburl") or info.get("url")
-        image = image.split("?")[0]
-        out.append({
-            "artist": "condo", "title": c["title"], "year": c["year"], "image": image,
-            "width": int(info.get("thumbwidth") or info.get("width") or 0),
-            "height": int(info.get("thumbheight") or info.get("height") or 0),
-            "style": "", "genre": "", "medium": c["medium"], "size": "", "collection": "",
-            "series": "", "description": "",
-            "source": info.get("descriptionurl", ""),
-        })
-    return out
+def resolve(token, refresh):
+    """An artist as typed ("Francis Bacon", "francis-bacon") to what WikiArt
+    and Wikipedia call them."""
+    slug = slugify(token)
+    if not slug:
+        return None
+    data = fetch(f"https://www.wikiart.org/en/{slug}?json=2", f"wikiart-artist/{slug}.json", refresh) or {}
+    name = clean(data.get("artistName")) if isinstance(data, dict) else ""
+    wiki_url = str(data.get("wikipediaUrl") or "") if isinstance(data, dict) else ""
+    wiki_title = urllib.parse.unquote(wiki_url.rsplit("/wiki/", 1)[1]).replace("_", " ") if "/wiki/" in wiki_url else ""
+    if not name:
+        # Not on WikiArt: take the name as typed, or rebuild it from the slug.
+        name = token.strip() if " " in token.strip() else " ".join(w.capitalize() for w in slug.split("-"))
+    return {"slug": slug, "name": name, "onWikiart": bool(data.get("artistName")) if isinstance(data, dict) else False,
+            "wiki": wiki_title or name}
 
 
-def main():
-    refresh = "--refresh" in sys.argv
-    catalog = {"version": 1, "built": time.strftime("%Y-%m-%d"), "artists": {}, "paintings": []}
+def build_artist(artist, cap, refresh):
+    summary = wiki_summary(artist["wiki"], refresh) or {}
+    about = first_sentences(summary.get("extract", ""), 2)
 
-    for artist in ARTISTS:
-        print(f"{artist['name']}…", file=sys.stderr)
-        summary = wiki_summary(artist["wiki"].replace("_", " "), refresh) or {}
-        catalog["artists"][artist["id"]] = {
-            "name": artist["name"],
-            "about": first_sentences(summary.get("extract", ""), 2),
-            "url": summary.get("url", ""),
-        }
+    articles = {}
+    for title in wiki_category(f"Paintings_by_{artist['name'].replace(' ', '_')}", refresh):
+        articles.setdefault(norm(title), title)
+    for title in wiki_search(f'"{artist["name"]}" painting', refresh):
+        articles.setdefault(norm(title), title)
+    articles.pop(norm(artist["name"]), None)
 
-        paintings = wikiart_paintings(artist, refresh) if artist["wikiart"] else condo_paintings(refresh)
+    paintings = []
+    if artist["onWikiart"]:
+        listing = fetch(f"https://www.wikiart.org/en/App/Painting/PaintingsByArtist?artistUrl={artist['slug']}&json=2",
+                        f"wikiart/{artist['slug']}.json", refresh) or []
+        paintings = wikiart_paintings(artist, listing, set(articles), cap, refresh)
 
-        # Painting articles on Wikipedia, matched by normalized title, then
-        # confirmed by the article actually naming the artist.
-        articles = {}
-        for category in artist["categories"]:
-            for title in wiki_category(category, refresh):
-                articles.setdefault(norm(title), title)
-        for title in wiki_search(f'"{artist["name"]}" painting', refresh):
-            articles.setdefault(norm(title), title)
-        articles.pop(norm(artist["name"]), None)
-        surname = artist["name"].split()[-1].lower()
-        matched = set()
-        for p in paintings:
-            title = articles.get(norm(p["title"]))
-            if not title:
-                continue
-            s = wiki_summary(title, refresh)
-            if s and surname in (s["extract"] + s["description"]).lower():
-                p["wiki"] = {"extract": s["extract"], "url": s["url"]}
-                matched.add(title)
-        for title in articles.values():
-            if title in matched:
-                continue
+    surname = artist["name"].split()[-1].lower()
+    matched = set()
+    for p in paintings:
+        title = articles.get(norm(p["title"]))
+        s = wiki_summary(title, refresh) if title else None
+        if s and surname in (s["extract"] + s["description"]).lower():
+            p["wiki"] = {"extract": s["extract"], "url": s["url"]}
+            matched.add(title)
+    for title in articles.values():
+        if title not in matched:
             extra = wiki_painting(title, artist, refresh)
-            if extra and extra["wiki"]:
+            if extra:
                 paintings.append(extra)
+    # Commons is noisy, so only when there is next to nothing else (living
+    # artists WikiArt does not carry).
+    if len(paintings) < 5:
+        paintings.extend(commons_paintings(artist, refresh))
 
-        # The same picture sometimes appears twice under one title and year.
-        seen, unique = set(), []
-        for p in paintings:
-            key = (norm(p["title"]), p["year"])
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(p)
-        with_wiki = sum(1 for p in unique if "wiki" in p)
-        print(f"  {len(unique)} paintings, {with_wiki} with a Wikipedia article", file=sys.stderr)
-        catalog["paintings"].extend(unique)
-
-    # Some listed images are gone from the server. Check each one once (the
-    # answers are cached) and leave out the ones that do not load.
     # WikiArt sometimes lacks the "!Large" rendition but still has the
-    # original; fall back to it before giving up on the painting.
-    kept = []
-    for p in catalog["paintings"]:
+    # original; fall back to it before giving up on a painting.
+    seen, kept = set(), []
+    for p in paintings:
+        key = (norm(p["title"]), p["year"])
+        if key in seen or not p["title"]:
+            continue
         if not image_ok(p["image"], refresh) and p["image"].endswith("!Large.jpg"):
             p["image"] = p["image"][:-len("!Large.jpg")]
         if image_ok(p["image"], refresh):
+            seen.add(key)
             kept.append(p)
-    catalog["paintings"] = kept
+    kept = kept[:cap]
+    return {"name": artist["name"], "about": about, "url": summary.get("url", "")}, kept
+
+
+def main():
+    global CACHE
+    parser = argparse.ArgumentParser(description="Build a Salon catalog.")
+    parser.add_argument("--artists", help="comma-separated WikiArt names or slugs (default: the built-in set)")
+    parser.add_argument("--out", default=os.path.join(ROOT, "catalog.json"))
+    parser.add_argument("--cache", default=os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "salon", "http"))
+    parser.add_argument("--max-per-artist", type=int, default=200)
+    parser.add_argument("--refresh", action="store_true", help="ignore cached answers")
+    args = parser.parse_args()
+    CACHE = args.cache
+    cap = max(10, min(2000, args.max_per_artist))
+
+    tokens = [t for t in (args.artists.split(",") if args.artists else DEFAULT_ARTISTS) if t.strip()][:MAX_ARTISTS]
+    catalog = {"version": 2, "built": time.strftime("%Y-%m-%d"), "artists": {}, "paintings": []}
+    for i, token in enumerate(tokens):
+        artist = resolve(token, args.refresh)
+        print(f"progress {i} {len(tokens)} {artist['name'] if artist else token.strip()}", flush=True)
+        if not artist or artist["slug"] in catalog["artists"]:
+            continue
+        info, paintings = build_artist(artist, cap, args.refresh)
+        if not paintings:
+            log(f"{artist['name']}: no paintings found")
+            continue
+        log(f"{artist['name']}: {len(paintings)} paintings, {sum(1 for p in paintings if 'wiki' in p)} with a Wikipedia article")
+        catalog["artists"][artist["slug"]] = info
+        catalog["paintings"].extend(paintings)
+
+    if not catalog["paintings"]:
+        log("No paintings found for any of those artists.")
+        return 1
+
     # A key that survives rebuilds, unlike the position in the list:
     # favourites and their Context Engine notes are filed under it.
     keys = set()
@@ -375,13 +440,18 @@ def main():
             key, n = f"{base}-{n}", n + 1
         keys.add(key)
         p["key"] = key
-    tmp = OUT + ".tmp"
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    tmp = args.out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(catalog, f, ensure_ascii=False, indent=1)
         f.write("\n")
-    os.replace(tmp, OUT)
-    print(f"Wrote {len(catalog['paintings'])} paintings to {OUT}", file=sys.stderr)
+    os.replace(tmp, args.out)
+    print(f"progress {len(tokens)} {len(tokens)} ", flush=True)
+    print(f"done {len(catalog['paintings'])} {args.out}", flush=True)
+    return 0
+
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

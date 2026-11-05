@@ -3,14 +3,24 @@
   "salon.tooltip": "%1\n%2",
   "salon.loading": "Hanging the painting…",
   "salon.offline": "Couldn't load the last few paintings. Check your connection, then press Space to try again.",
-  "salon.empty": "The catalog is missing or empty. Run bin/build-catalog in the Salon folder.",
+  "salon.empty": "The catalog is missing or empty. Reinstall Salon, or check the artists in its settings.",
   "salon.aboutArtist": "About the artist",
   "salon.favorite": "Save to favourites (F)",
   "salon.unfavorite": "Remove from favourites (F)",
   "salon.noFavorites": "No favourites yet. Press F on a painting you love to keep it.",
-  "salon.favoritesOnly": { "one": "Favourites only · %1", "other": "Favourites only · %1" },
-  "salon.favoritesCount": { "one": "%1 favourite", "other": "%1 favourites" },
+  "salon.favoritesOnly": {
+    "one": "Favourites only · %1",
+    "other": "Favourites only · %1"
+  },
+  "salon.favoritesCount": {
+    "one": "%1 favourite",
+    "other": "%1 favourites"
+  },
   "salon.syncError": "Favourites are saved on this computer. Context Engine: %1",
   "salon.keys": "Space next  ·  ← back  ·  F favourite  ·  Z full view\nG favourites  ·  Shift+F favourites only  ·  O open page",
-  "salon.gridKeys": "Arrows move  ·  Enter open  ·  Z full view  ·  F remove  ·  G or Esc back"
+  "salon.gridKeys": "Arrows move  ·  Enter open  ·  Z full view  ·  F remove  ·  G or Esc back",
+  "salon.buildStarting": "Building your collection… showing the built-in paintings meanwhile.",
+  "salon.building": "Building your collection: %1 (%2 of %3)… showing the built-in paintings meanwhile.",
+  "salon.buildError": "Couldn't build your collection, so the built-in paintings are showing. %1",
+  "salon.buildFailed": "The catalog builder stopped without saying why."
 }

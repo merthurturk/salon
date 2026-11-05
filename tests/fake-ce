@@ -19,7 +19,8 @@ elif name == "edit":
     db[payload["ref"]]["archived"] = payload["archived"]
     result = {"ref": payload["ref"]}
 elif name == "find":
-    hits = [{"ref": r} for r, n in db.items() if not n["archived"] and payload["tags"][0] in n["tags"]]
+    hits = [{"ref": r, "body": n["body"], "fields": {"tags": n["tags"]}}
+            for r, n in db.items() if not n["archived"] and payload["tags"][0] in n["tags"]]
     result = {"hits": hits}
 json.dump(db, open(db_path, "w"))
 print(json.dumps({"text": "", "data": result}))

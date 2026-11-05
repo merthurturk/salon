@@ -39,7 +39,7 @@ function parseCatalog(text) {
   var artistIds = []
   var rawArtists = raw.artists || {}
   for (var id in rawArtists) {
-    if (!/^[a-z0-9-]{1,40}$/.test(id)) continue
+    if (!/^[a-z0-9-]{1,60}$/.test(id)) continue
     var a = rawArtists[id] || {}
     artists[id] = { id: id, name: str(a.name, MAX_SHORT), about: str(a.about, MAX_TEXT), url: safeLink(a.url) }
     artistIds.push(id)
@@ -77,27 +77,87 @@ function parseCatalog(text) {
   return { artists: artists, artistIds: artistIds, paintings: paintings, byKey: byKey }
 }
 
-// The favourites file bin/salon writes. Only what the widget needs: which
-// keys are favourites (newest first), where a kept copy of the image is, and
-// whether Context Engine could be reached. Keys the catalog does not know are
-// left out, and so are favourites being removed.
-function parseFavorites(text, catalog) {
-  var result = { keys: [], cached: {}, syncError: "" }
+// The favourites file bin/salon writes. Each favourite carries its own
+// title, artist and image, so it can be shown even when the catalog in use
+// is a different collection. Favourites being removed are left out.
+function parseFavorites(text) {
+  var result = { rows: [], syncError: "" }
   var raw
   try { raw = JSON.parse(text) } catch (e) { return result }
   if (!raw || typeof raw !== "object" || !raw.items || typeof raw.items !== "object") return result
-  var rows = []
+  var count = 0
   for (var key in raw.items) {
+    if (++count > MAX_PAINTINGS) break
     var item = raw.items[key] || {}
-    if (catalog.byKey[key] === undefined || item.pending === "remove") continue
-    rows.push({ key: key, added: str(item.added, 40) })
+    if (!/^[a-z0-9][a-z0-9-]{0,129}$/.test(key) || item.pending === "remove") continue
     var cached = str(item.cached, 200)
-    if (/^images\/[a-z0-9-]+\.(jpg|png|webp|gif)$/.test(cached)) result.cached[key] = cached
+    var image = str(item.image, 600)
+    result.rows.push({
+      key: key,
+      added: str(item.added, 40),
+      cached: /^images\/[a-z0-9-]+\.(jpg|png|webp|gif)$/.test(cached) ? cached : "",
+      title: str(item.title, MAX_SHORT) || "Untitled",
+      artist: /^[a-z0-9-]{1,60}$/.test(String(item.artist)) ? String(item.artist) : "unknown",
+      artistName: str(item.artistName, MAX_SHORT),
+      year: str(item.year, 20),
+      image: IMAGE_HOSTS.test(image) ? image : "",
+      link: safeLink(item.link)
+    })
   }
-  rows.sort(function(a, b) { return a.added < b.added ? 1 : a.added > b.added ? -1 : 0 })
-  result.keys = rows.map(function(r) { return r.key })
+  result.rows.sort(function(a, b) { return a.added < b.added ? 1 : a.added > b.added ? -1 : 0 })
   result.syncError = str(raw.syncError, 200)
   return result
+}
+
+// The catalog in use plus any favourite it does not include, appended after
+// its own paintings so their positions stay put. Appended favourites are
+// marked extra: they show in the grid and in favourites-only mode, but the
+// random picks stay within the collection.
+function combine(base, favorites) {
+  var paintings = base.paintings.slice()
+  var byKey = {}
+  for (var k in base.byKey) byKey[k] = base.byKey[k]
+  var artists = {}
+  for (var a in base.artists) artists[a] = base.artists[a]
+  var keys = []
+  var cached = {}
+  var extras = favorites.rows.filter(function(r) { return byKey[r.key] === undefined })
+  extras.sort(function(x, y) { return x.key < y.key ? -1 : x.key > y.key ? 1 : 0 })
+  for (var i = 0; i < extras.length; i++) {
+    var r = extras[i]
+    if (!r.image && !r.cached) continue
+    byKey[r.key] = paintings.length
+    paintings.push({ key: r.key, artist: r.artist, title: r.title, year: r.year, image: r.image,
+      width: 0, height: 0, style: "", genre: "", medium: "", size: "", collection: "", series: "",
+      note: "", link: r.link, extra: true })
+    if (!artists[r.artist]) artists[r.artist] = { id: r.artist, name: r.artistName, about: "", url: "" }
+  }
+  for (var j = 0; j < favorites.rows.length; j++) {
+    var row = favorites.rows[j]
+    if (byKey[row.key] === undefined) continue
+    keys.push(row.key)
+    if (row.cached) cached[row.key] = row.cached
+  }
+  return {
+    catalog: { artists: artists, artistIds: base.artistIds, paintings: paintings, byKey: byKey },
+    keys: keys, cached: cached, syncError: favorites.syncError
+  }
+}
+
+// The artist list as typed in settings ("Francis Bacon, philip-guston") as
+// WikiArt slugs, in order, without repeats.
+function artistSlugs(setting) {
+  var text = Array.isArray(setting) ? setting.join(",") : str(setting, 2000)
+  var seen = {}
+  var out = []
+  var parts = text.split(",")
+  for (var i = 0; i < parts.length && out.length < 40; i++) {
+    var s = parts[i].trim().toLowerCase()
+    if (s.normalize) s = s.normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+    s = s.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60)
+    if (s && !seen[s]) { seen[s] = true; out.push(s) }
+  }
+  return out
 }
 
 // A random favourite, skipping the ones shown lately while others remain.
@@ -125,7 +185,7 @@ function byArtist(catalog, only) {
   var groups = {}
   for (var j = 0; j < catalog.paintings.length; j++) {
     var artist = catalog.paintings[j].artist
-    if (any && !wanted[artist]) continue
+    if (catalog.paintings[j].extra || (any && !wanted[artist])) continue
     if (!groups[artist]) groups[artist] = []
     groups[artist].push(j)
   }
@@ -196,6 +256,7 @@ function frameHeight(painting, width, maxHeight) {
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { parseCatalog: parseCatalog, parseFavorites: parseFavorites, pickFavorite: pickFavorite, byArtist: byArtist, pick: pick, remember: remember,
+  module.exports = { parseCatalog: parseCatalog, parseFavorites: parseFavorites, combine: combine,
+    artistSlugs: artistSlugs, pickFavorite: pickFavorite, byArtist: byArtist, pick: pick, remember: remember,
     byline: byline, facts: facts, note: note, frameHeight: frameHeight, safeLink: safeLink, RECENT: RECENT }
 }

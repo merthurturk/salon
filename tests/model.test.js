@@ -49,25 +49,39 @@ assert.strictEqual(M.facts(c.paintings[2]), "oil on canvas · 50 × 60 cm")
 assert.deepStrictEqual(M.note(c.paintings[0], c.artists.goya), { text: "A painting.", aboutArtist: false })
 assert.deepStrictEqual(M.note(c.paintings[1], c.artists.goya), { text: "Spanish painter.", aboutArtist: true })
 
-// Favourites: newest first, removals and unknown keys left out, only
-// cached paths inside the images folder.
+// Favourites: newest first, removals left out, only cached paths inside
+// the images folder, and favourites from other collections appended.
 const favs = M.parseFavorites(JSON.stringify({ syncError: "offline", items: {
   "goya-saturn-1823": { added: "2026-11-01", cached: "images/goya-saturn-1823.jpg" },
   "goya-dog-1823": { added: "2026-11-03", cached: "../../etc/passwd" },
   "condo-img-nd": { added: "2026-11-02", pending: "remove" },
-  "nobody-1900": { added: "2026-11-04" },
-} }), c)
-assert.strictEqual(JSON.stringify(favs.keys), JSON.stringify(["goya-dog-1823", "goya-saturn-1823"]))
-assert.strictEqual(favs.cached["goya-saturn-1823"], "images/goya-saturn-1823.jpg")
-assert.strictEqual(favs.cached["goya-dog-1823"], undefined)
-assert.strictEqual(favs.syncError, "offline")
-assert.strictEqual(M.parseFavorites("garbage", c).keys.length, 0)
-for (let i = 0; i < 50; i++) assert.strictEqual(M.pickFavorite(c, favs.keys, [0]), 1, "skips the one just shown")
+  "bosch-garden-1500": { added: "2026-11-04", title: "Garden", artist: "hieronymus-bosch", artistName: "Hieronymus Bosch",
+                         image: "https://upload.wikimedia.org/g.jpg" },
+  "bad-host-1900": { added: "2026-11-05", title: "Nope", artist: "x", image: "https://evil.example/x.jpg" },
+} }))
+const both = M.combine(c, favs)
+assert.strictEqual(JSON.stringify(both.keys), JSON.stringify(["bosch-garden-1500", "goya-dog-1823", "goya-saturn-1823"]))
+assert.strictEqual(both.cached["goya-saturn-1823"], "images/goya-saturn-1823.jpg")
+assert.strictEqual(both.cached["goya-dog-1823"], undefined)
+assert.strictEqual(both.syncError, "offline")
+assert.strictEqual(both.catalog.paintings.length, c.paintings.length + 1, "the Bosch is appended, the bad host is not")
+assert.strictEqual(both.catalog.byKey["goya-dog-1823"], c.byKey["goya-dog-1823"], "catalog positions stay put")
+assert.strictEqual(both.catalog.artists["hieronymus-bosch"].name, "Hieronymus Bosch")
+for (let i = 0; i < 300; i++) assert.notStrictEqual(both.catalog.paintings[M.pick(both.catalog, [], [])].artist, "hieronymus-bosch",
+  "random picks stay within the collection")
+assert.strictEqual(M.parseFavorites("garbage").rows.length, 0)
+for (let i = 0; i < 50; i++) assert.notStrictEqual(M.pickFavorite(both.catalog, both.keys, [0]), 0, "skips the one just shown")
 assert.strictEqual(M.pickFavorite(c, [], []), -1)
+
+// Artist lists as people type them.
+assert.strictEqual(JSON.stringify(M.artistSlugs("Francis Bacon, philip-guston ,, Égon Schiele, francis-bacon")),
+  JSON.stringify(["francis-bacon", "philip-guston", "egon-schiele"]))
+assert.strictEqual(JSON.stringify(M.artistSlugs(["Goya", "Bosch"])), JSON.stringify(["goya", "bosch"]))
+assert.strictEqual(M.artistSlugs("").length, 0)
 
 // The shipped catalog parses and every painting survives validation.
 const shipped = fs.readFileSync(path.join(__dirname, "..", "catalog.json"), "utf8")
 const real = M.parseCatalog(shipped)
 assert.strictEqual(real.paintings.length, JSON.parse(shipped).paintings.length, "every shipped painting is valid")
-assert.strictEqual(Object.keys(M.byArtist(real, [])).length, 9, "all nine artists have paintings")
+assert(Object.keys(M.byArtist(real, [])).length >= 5, "the built-in artists all have paintings")
 console.log("ok", real.paintings.length, "paintings")

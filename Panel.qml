@@ -18,8 +18,8 @@ import "Model.js" as Model
 // against.
 Panel {
   id: root
-  moduleName: "mert.salon"
-  ipcTarget: "mert.salon"
+  moduleName: "merthurturk.salon"
+  ipcTarget: "merthurturk.salon"
   manageIpc: false
 
   property var anchorItem: null
@@ -32,8 +32,34 @@ Panel {
   readonly property string helper: pluginDir + "/bin/salon"
   readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/salon"
 
-  // ---- Catalog and position.
-  property var catalog: ({ artists: {}, artistIds: [], paintings: [], byKey: {} })
+  readonly property string cacheDir: (Quickshell.env("XDG_CACHE_HOME") || (Quickshell.env("HOME") + "/.cache")) + "/salon"
+
+  // ---- Settings.
+  // The artists to build a collection from; empty keeps the built-in one.
+  readonly property var artistSlugs: Model.artistSlugs(setting("artists", ""))
+  readonly property int perArtist: Math.max(10, Math.min(1000, parseInt(setting("paintingsPerArtist", 150), 10) || 150))
+  // Auto syncs favourites when the Context Engine plugin is installed.
+  readonly property bool syncFavorites: String(setting("contextEngine", "Auto")) !== "Off"
+
+  // ---- The catalog: built in, or built here for the user's artists.
+  readonly property string builtinPath: pluginDir + "/catalog.json"
+  readonly property string customPath: artistSlugs.length
+    ? cacheDir + "/catalog-" + Qt.md5(artistSlugs.join(",") + "|" + perArtist) + ".json" : ""
+  property bool customReady: false
+  readonly property string catalogPath: customPath !== "" && customReady ? customPath : builtinPath
+  property var baseCatalog: ({ artists: {}, artistIds: [], paintings: [], byKey: {} })
+  property var favoritesRaw: ({ rows: [], syncError: "" })
+  readonly property var combined: Model.combine(baseCatalog, favoritesRaw)
+  readonly property var catalog: combined.catalog
+  readonly property var favorites: combined
+
+  // Building a collection: where it is, and what went wrong if it failed.
+  property bool building: false
+  property string buildArtist: ""
+  property int buildDone: 0
+  property int buildTotal: 0
+  property string buildError: ""
+
   // Paintings shown so far, oldest first, and where in that trail we are.
   property var trail: []
   property int position: -1
@@ -44,7 +70,6 @@ Panel {
   property int failures: 0
 
   // ---- Favourites.
-  property var favorites: ({ keys: [], cached: {}, syncError: "" })
   // Taps not yet reflected in the file, so the heart answers at once.
   property var overrides: ({})
   readonly property var favoriteSet: {
@@ -64,7 +89,6 @@ Panel {
   property int gridIndex: 0
   property bool fullView: false
 
-  readonly property var only: setting("artists", [])
   readonly property int currentIndex: position >= 0 && position < trail.length ? trail[position] : -1
   readonly property var painting: currentIndex >= 0 ? catalog.paintings[currentIndex] : null
   readonly property var artist: painting ? catalog.artists[painting.artist] : null
@@ -85,17 +109,95 @@ Panel {
   readonly property int cardWidth: Style.space(520)
   readonly property int maxImageHeight: Style.space(440)
 
-  onOnlyChanged: if (catalog.paintings.length && !favoritesOnly) restart()
+  // A new artist list starts from the built-in catalog until its own is ready.
+  // Settings change as people type, so wait for the list to settle, and stop
+  // a build that no longer matches it.
+  onCustomPathChanged: {
+    customReady = false
+    buildError = ""
+    if (buildProc.running) buildProc.running = false
+    settle.restart()
+  }
+
+  Timer {
+    id: settle
+    interval: 2000
+    onTriggered: if (root.customPath !== "") customFile.reload()
+  }
 
   property FileView catalogFile: FileView {
-    path: root.pluginDir + "/catalog.json"
+    path: root.catalogPath
     printErrors: false
     onLoaded: {
-      root.catalog = Model.parseCatalog(text())
-      favoritesFile.reload()
+      root.baseCatalog = Model.parseCatalog(text())
       root.restart()
     }
-    onLoadFailed: root.catalog = Model.parseCatalog("")
+    onLoadFailed: root.baseCatalog = Model.parseCatalog("")
+  }
+
+  // Only asks whether the user's collection exists yet; catalogFile loads it.
+  property FileView customFile: FileView {
+    path: root.customPath
+    printErrors: false
+    onLoaded: {
+      if (Model.parseCatalog(text()).paintings.length > 0) root.customReady = true
+      else root.buildCollection()
+    }
+    onLoadFailed: if (root.customPath !== "") root.buildCollection()
+  }
+
+  function buildCollection() {
+    if (buildProc.running || customPath === "") return
+    building = true
+    buildError = ""
+    buildDone = 0
+    buildTotal = artistSlugs.length
+    buildArtist = ""
+    buildProc.target = customPath
+    buildProc.lastError = ""
+    buildProc.command = [pluginDir + "/bin/build-catalog", "--artists", artistSlugs.join(","),
+      "--max-per-artist", String(perArtist), "--out", customPath]
+    buildProc.running = true
+  }
+
+  // For the IPC rebuild command: fetch everything again for this list.
+  function rebuildCollection() {
+    if (customPath === "") return
+    customReady = false
+    buildCollection()
+  }
+
+  Process {
+    id: buildProc
+    property string lastError: ""
+    // The catalog this run is writing; a run for an older list is ignored.
+    property string target: ""
+    stdout: SplitParser {
+      onRead: function(line) {
+        var m = /^progress (\d+) (\d+) ?(.*)$/.exec(String(line))
+        if (m) {
+          root.buildDone = parseInt(m[1], 10)
+          root.buildTotal = parseInt(m[2], 10)
+          root.buildArtist = m[3].slice(0, 120)
+        }
+      }
+    }
+    stderr: SplitParser {
+      onRead: function(line) {
+        var text = String(line)
+        if (!/^\s*!/.test(text)) buildProc.lastError = text.slice(0, 200)
+      }
+    }
+    onExited: function(code) {
+      root.building = false
+      if (buildProc.target !== root.customPath) return
+      if (code === 0) {
+        root.customReady = true
+        catalogFile.reload()
+      } else {
+        root.buildError = buildProc.lastError || strings.t("salon.buildFailed")
+      }
+    }
   }
 
   property FileView favoritesFile: FileView {
@@ -108,11 +210,11 @@ Panel {
   }
 
   function takeFavorites(text) {
-    favorites = Model.parseFavorites(text, catalog)
+    favoritesRaw = Model.parseFavorites(text)
     // Drop the taps the file now agrees with.
     var still = {}
     var inFile = {}
-    for (var i = 0; i < favorites.keys.length; i++) inFile[favorites.keys[i]] = true
+    for (var i = 0; i < favoritesRaw.rows.length; i++) inFile[favoritesRaw.rows[i].key] = true
     for (var key in overrides) if ((inFile[key] === true) !== overrides[key]) still[key] = overrides[key]
     overrides = still
   }
@@ -127,7 +229,9 @@ Panel {
 
   function pump() {
     if (helperProc.running || queue.length === 0) return
-    helperProc.command = [root.helper].concat(queue[0])
+    var options = ["--catalog", root.catalogPath]
+    if (!root.syncFavorites) options.push("--local")
+    helperProc.command = [root.helper].concat(options, queue[0])
     queue = queue.slice(1)
     helperProc.running = true
   }
@@ -170,7 +274,7 @@ Panel {
   // ---- Moving through paintings.
   function chooseNext() {
     var recent = trail.slice(-Model.RECENT)
-    return favoritesOnly ? Model.pickFavorite(catalog, favoriteKeys, recent) : Model.pick(catalog, only, recent)
+    return favoritesOnly ? Model.pickFavorite(catalog, favoriteKeys, recent) : Model.pick(catalog, [], recent)
   }
 
   function restart() {
@@ -373,6 +477,22 @@ Panel {
           id: column
           width: scroller.width
           spacing: Style.space(10)
+
+          // While the user's collection builds, the built-in one is showing.
+          Text {
+            width: parent.width
+            visible: root.building || root.buildError !== ""
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: root.building
+              ? (root.buildArtist !== ""
+                  ? strings.t("salon.building").arg(root.buildArtist).arg(root.buildDone + 1).arg(root.buildTotal)
+                  : strings.t("salon.buildStarting"))
+              : strings.t("salon.buildError").arg(root.buildError)
+            color: root.building ? root.dimmed : Commons.Color.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
 
           Text {
             visible: root.favoritesOnly

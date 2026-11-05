@@ -1,12 +1,14 @@
 {
   "schemaVersion": 1,
-  "id": "mert.salon",
+  "id": "merthurturk.salon",
   "name": "Salon",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "author": "Mert Hurturk",
   "license": "MIT",
-  "description": "A random painting by Goya, Ensor, Bacon, de Kooning, Guston, Dubuffet, Appel, Jorn or Condo, with its title, date and a few lines about it.",
-  "kinds": ["bar-widget"],
+  "description": "A painting in your bar: click for a random work by the artists you choose, with its title, date and a few lines about it. Keep favourites, browse them in a grid, and see any painting full screen.",
+  "kinds": [
+    "bar-widget"
+  ],
   "entryPoints": {
     "barWidget": "BarWidget.qml"
   },
@@ -14,8 +16,43 @@
     "displayName": "Salon",
     "description": "Click for a painting; right-click for another; middle-click to open its page.",
     "category": "Info",
-    "aliases": ["art", "painting", "museum"],
+    "aliases": [
+      "art",
+      "painting",
+      "museum"
+    ],
     "allowMultiple": false,
-    "defaultSection": "centerEnd"
-  }
+    "defaultSection": "centerEnd",
+    "schema": [
+      {
+        "key": "artists",
+        "type": "string",
+        "label": "Artists",
+        "description": "Comma-separated, as WikiArt names them, e.g. Francis Bacon, Philip Guston, Egon Schiele. Leave empty for the built-in masters (Goya, Bosch, Bruegel, Rembrandt, Turner, Van Gogh). A new list is built on this computer in the background, which can take a few minutes.",
+        "defaultValue": ""
+      },
+      {
+        "key": "paintingsPerArtist",
+        "type": "integer",
+        "label": "Paintings per artist",
+        "min": 10,
+        "max": 1000,
+        "step": 10,
+        "defaultValue": 150,
+        "description": "The most a built collection keeps of any one artist. More means a longer first build."
+      },
+      {
+        "key": "contextEngine",
+        "type": "enum",
+        "label": "Sync favourites to Context Engine",
+        "options": [
+          "Auto",
+          "Off"
+        ],
+        "defaultValue": "Auto",
+        "description": "Auto saves each favourite as a Context Engine note when the Context Engine plugin is installed, so your other machines share them. Off keeps favourites on this computer only."
+      }
+    ]
+  },
+  "homepage": "https://github.com/merthurturk/salon"
 }

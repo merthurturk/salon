@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Salon's favourites: kept on this computer and in Context Engine.
 
-  salon fav add <key>      Save a painting, keep a copy of its image, tell Context Engine
-  salon fav remove <key>   Take it out again (its note is archived, not deleted)
-  salon sync               Send what is waiting and take in favourites made elsewhere
-  salon list               Print the favourites as JSON
+  salon [options] fav add <key>      Save a painting, keep a copy of its image, tell Context Engine
+  salon [options] fav remove <key>   Take it out again (its note is archived, not deleted)
+  salon [options] sync               Send what is waiting and take in favourites made elsewhere
+  salon [options] list               Print the favourites as JSON
+
+Options:
+  --catalog PATH   the catalog the key comes from (default: the built-in one)
+  --local          keep favourites on this computer only; no Context Engine
 
 Every command prints one JSON line ({"ok": …, "synced": …, "message": …}) and
 exits 0 when the favourites file was updated, 1 when it was not.
@@ -13,7 +17,12 @@ The favourites file ($XDG_STATE_HOME/salon/favorites.json) is the widget's
 truth; it watches it. Context Engine is reached through the `ce` command of
 the relote.context-engine plugin. Each favourite is one note, slug
 salon-favourite-<key>, tagged salon-favourite. A change that cannot reach the
-engine is marked pending and sent on the next sync.
+engine is marked pending and sent on the next sync. Without the
+Context Engine plugin, favourites simply stay on this computer.
+
+A favourite keeps its own title, artist and image, so it still shows after
+the widget switches to a collection that does not include it; the note body
+carries the same details for the other machines.
 """
 
 import fcntl
@@ -26,8 +35,13 @@ import sys
 import time
 import urllib.request
 
+ARGS = sys.argv[1:]
+LOCAL = "--local" in ARGS
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CATALOG = os.environ.get("SALON_CATALOG", os.path.join(ROOT, "catalog.json"))
+if "--catalog" in ARGS and ARGS.index("--catalog") + 1 < len(ARGS):
+    CATALOG = ARGS[ARGS.index("--catalog") + 1]
 STATE = os.environ.get("SALON_STATE") or os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "salon")
 FAVORITES = os.path.join(STATE, "favorites.json")
@@ -79,9 +93,10 @@ def save(state):
 
 
 def entry(p):
+    link = (p.get("wiki") or {}).get("url") or p.get("source", "")
     return {
         "title": p.get("title", ""), "artist": p.get("artist", ""), "artistName": p.get("artistName", ""),
-        "year": p.get("year", ""), "image": p.get("image", ""), "link": (p.get("wiki") or {}).get("url") or p.get("source", ""),
+        "year": p.get("year", ""), "image": p.get("image", ""), "link": link,
         "added": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "cached": "", "pending": "",
     }
 
@@ -128,9 +143,13 @@ class Unreachable(Exception):
     pass
 
 
+class NoEngine(Exception):
+    """Context Engine is not set up here, or syncing is off: not an error."""
+
+
 def ce(*args):
-    if not os.access(CE, os.X_OK):
-        raise Unreachable("Context Engine plugin is not installed")
+    if LOCAL or not os.access(CE, os.X_OK):
+        raise NoEngine()
     try:
         r = subprocess.run([CE, *args], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -156,7 +175,7 @@ def engine():
 
 
 def note_body(key, item):
-    lines = [f"A painting Mert saved in Salon, the art widget on the Omarchy bar.", "",
+    lines = ["A painting saved in Salon, the art widget for the Omarchy bar.", "",
              f"- **Painting:** {item['title']}",
              f"- **Artist:** {item['artistName']}"]
     if item.get("year"):
@@ -193,10 +212,25 @@ def push_remove(eng, key):
             raise
 
 
+FIELD = re.compile(r"^- \*\*(Painting|Artist|Year|Page|Image):\*\* (.+)$", re.M)
+
+
+def from_note(hit):
+    """A favourite's details read back from the note body note_body wrote."""
+    found = dict(FIELD.findall(str(hit.get("body") or "")))
+    tags = (hit.get("fields") or {}).get("tags") or hit.get("tags") or []
+    artist = next((t[7:] for t in tags if isinstance(t, str) and t.startswith("artist:")), "")
+    if not found.get("Painting") or not IMAGE_HOSTS.match(found.get("Image", "")):
+        return None
+    return {"title": found["Painting"][:200], "artist": artist[:60], "artistName": found.get("Artist", "")[:200],
+            "year": found.get("Year", "")[:20], "image": found["Image"][:600], "link": found.get("Page", "")[:600],
+            "added": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "cached": "", "pending": ""}
+
+
 def pull(eng):
     """Every favourite in the engine, or Unreachable: never a partial list,
     since a key missing from it means the favourite was removed elsewhere."""
-    keys, cursor = set(), None
+    keys, cursor = {}, None
     for _ in range(40):
         payload = {"engine": eng, "tags": [TAG], "type": ["note"], "order": "oldest", "limit": 50}
         if cursor:
@@ -207,7 +241,7 @@ def pull(eng):
             if ref.startswith("note::" + SLUG_PREFIX):
                 key = ref[len("note::" + SLUG_PREFIX):]
                 if KEY.match(key):
-                    keys.add(key)
+                    keys[key] = hit
         cursor = data.get("cursor")
         if not cursor or not data.get("hits"):
             return keys
@@ -230,10 +264,11 @@ def sync(state, paintings):
         if key not in remote and not items[key].get("pending"):
             drop_image(items[key])
             del items[key]
-    for key in remote - set(items):
-        if key in paintings:
-            items[key] = entry(paintings[key])
-            cache_image(key, items[key])
+    for key in set(remote) - set(items):
+        item = entry(paintings[key]) if key in paintings else from_note(remote[key])
+        if item:
+            items[key] = item
+            cache_image(key, item)
     state["lastSync"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     state["syncError"] = ""
 
@@ -243,6 +278,17 @@ def with_sync(state, paintings, message):
         sync(state, paintings)
         save(state)
         return out(True, True, message)
+    except NoEngine:
+        # Local only: nothing waits to be sent, and there is nothing to report.
+        for key, item in list(state["items"].items()):
+            if item.get("pending") == "remove":
+                drop_image(item)
+                del state["items"][key]
+            else:
+                item["pending"] = ""
+        state["syncError"] = ""
+        save(state)
+        return out(True, False, message)
     except Unreachable as e:
         state["syncError"] = str(e)[:200]
         save(state)
@@ -250,6 +296,16 @@ def with_sync(state, paintings, message):
 
 
 def main(argv):
+    # Options may come before the command.
+    rest, skip = [], False
+    for i, a in enumerate(argv):
+        if skip:
+            skip = False
+        elif a == "--catalog":
+            skip = True
+        elif a != "--local":
+            rest.append(a)
+    argv = rest
     os.makedirs(STATE, exist_ok=True)
     with open(os.path.join(STATE, ".lock"), "w") as lock:
         # Quick toggles queue up here rather than writing over each other.
@@ -266,7 +322,8 @@ def main(argv):
             if key not in paintings:
                 print(f"salon: no painting {key!r}", file=sys.stderr)
                 return out(False, message="unknown painting")
-            item = state["items"].get(key) or entry(paintings[key])
+            # Re-saving keeps the original date, so the grid order holds.
+            item = dict(entry(paintings[key]), added=state["items"].get(key, {}).get("added") or entry(paintings[key])["added"])
             item["pending"] = "add"
             state["items"][key] = item
             save(state)

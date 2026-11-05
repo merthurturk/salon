@@ -8,7 +8,7 @@ import qs.Ui
 // current painting's page in the browser.
 BarWidget {
   id: root
-  moduleName: "mert.salon"
+  moduleName: "merthurturk.salon"
 
   function injectPanel() {
     var target = panelLoader.item
@@ -29,10 +29,11 @@ BarWidget {
   function toggle() { if (panelLoader.item) panelLoader.item.toggle() }
   function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
 
-  // For keybindings and scripts: omarchy-shell mert.salon <function>.
+  // For keybindings and scripts: omarchy-shell merthurturk.salon <function>.
   IpcHandler {
-    target: "mert.salon"
+    target: "merthurturk.salon"
 
+    function rebuild(): void { if (panelLoader.item) panelLoader.item.rebuildCollection() }
     function next(): void { if (panelLoader.item) panelLoader.item.next() }
     function favorite(): void { if (panelLoader.item) panelLoader.item.toggleFavorite() }
     function fullView(): void { if (panelLoader.item) panelLoader.item.showFullView() }
