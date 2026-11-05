@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "mert.salon",
+  "name": "Salon",
+  "version": "0.1.0",
+  "author": "Mert Hurturk",
+  "license": "MIT",
+  "description": "A random painting by Goya, Ensor, Bacon, de Kooning, Guston, Dubuffet, Appel, Jorn or Condo, with its title, date and a few lines about it.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Salon",
+    "description": "Click for a painting; right-click for another; middle-click to open its page.",
+    "category": "Info",
+    "aliases": ["art", "painting", "museum"],
+    "allowMultiple": false,
+    "defaultSection": "centerEnd"
+  }
+}

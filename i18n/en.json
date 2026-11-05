@@ -1,0 +1,9 @@
+{
+  "salon.name": "Salon",
+  "salon.tooltip": "%1\n%2",
+  "salon.loading": "Hanging the painting…",
+  "salon.offline": "Couldn't load the last few paintings. Check your connection, then press Space to try again.",
+  "salon.empty": "The catalog is missing or empty. Run bin/build-catalog in the Salon folder.",
+  "salon.aboutArtist": "About the artist",
+  "salon.keys": "Space next  ·  ← back  ·  O open page  ·  Esc close"
+}
